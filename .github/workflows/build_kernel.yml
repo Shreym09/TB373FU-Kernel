@@ -27,6 +27,9 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/.cache"
           rm -rf ~/.cache
           ln -s "$GITHUB_WORKSPACE/.cache" ~/.cache
+          # /tmp is on the root disk too, so send temp files to the big volume
+          mkdir -p "$GITHUB_WORKSPACE/tmp"
+          echo "TMPDIR=$GITHUB_WORKSPACE/tmp" >> "$GITHUB_ENV"
           df -h / "$GITHUB_WORKSPACE"
 
       - name: Install Build Dependencies
@@ -45,37 +48,53 @@ jobs:
 
       - name: Sync Android Common Kernel (ACK 6.1)
         run: |
+          # Print disk usage every 60s so a failure shows which disk filled up
+          (while true; do sleep 60; echo "--- disk ---"; df -h / "$GITHUB_WORKSPACE"; done) &
+          MON=$!
+          trap 'kill $MON 2>/dev/null || true' EXIT
           mkdir -p "$GITHUB_WORKSPACE/ack-6.1"
           cd "$GITHUB_WORKSPACE/ack-6.1"
           repo init -u https://android.googlesource.com/kernel/manifest -b common-android14-6.1 --depth=1
           repo sync -c -j$(nproc) --no-tags --no-clone-bundle
           df -h / "$GITHUB_WORKSPACE"
 
-      - name: Integrate KernelSU-Next & SuSFS
+      - name: Integrate KernelSU-Next (SuSFS branch) & SuSFS kernel patch
         run: |
+          set -euo pipefail
           cd "$GITHUB_WORKSPACE/ack-6.1/common"
 
-          # Setup KernelSU-Next
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next
+          # KernelSU-Next fork that already has SuSFS built in (the one WildKernels builds with).
+          # Full clone (no --depth) so the KernelSU version number can be computed from git history.
+          git clone https://github.com/pershoot/KernelSU-Next.git -b dev-susfs KernelSU-Next
+          # Bazel treats nested BUILD files as separate packages and would skip those sources
+          find KernelSU-Next \( -name BUILD -o -name BUILD.bazel \) -not -path '*/.git/*' -delete
 
-          # Setup SuSFS Patches for GKI 6.1
+          # Hook the driver into the kernel tree (this is what KernelSU's setup.sh does)
+          ln -sfn ../KernelSU-Next/kernel drivers/kernelsu
+          grep -q 'CONFIG_KSU)' drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+          grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+
+          test -f drivers/kernelsu/Kconfig
+          grep -rq KSU_SUSFS KernelSU-Next/kernel || echo "::warning::No SuSFS options found in KernelSU-Next kernel dir"
+
+          # SuSFS kernel-side patch for GKI android14-6.1 (no '|| true': a failed hunk must stop the build)
           git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android14-6.1 "$GITHUB_WORKSPACE/susfs"
-          cp "$GITHUB_WORKSPACE/susfs/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" ./KernelSU-Next/
-          cp "$GITHUB_WORKSPACE"/susfs/kernel_patches/fs/* ./fs/
-          cp "$GITHUB_WORKSPACE"/susfs/kernel_patches/include/linux/* ./include/linux/
-
-          # Apply SuSFS patch to KernelSU
-          cd KernelSU-Next
-          patch -p1 < 10_enable_susfs_for_ksu.patch || true
-          cd ..
-
-          # Apply GKI SuSFS patch
-          cp "$GITHUB_WORKSPACE/susfs/kernel_patches/50_add_susfs_in_gki-android14-6.1.patch" ./
-          patch -p1 < 50_add_susfs_in_gki-android14-6.1.patch || true
+          cp "$GITHUB_WORKSPACE"/susfs/kernel_patches/fs/* fs/
+          cp "$GITHUB_WORKSPACE"/susfs/kernel_patches/include/linux/* include/linux/
+          cp "$GITHUB_WORKSPACE/susfs/kernel_patches/50_add_susfs_in_gki-android14-6.1.patch" .
+          patch -p1 < 50_add_susfs_in_gki-android14-6.1.patch
+          rm -f 50_add_susfs_in_gki-android14-6.1.patch
 
       - name: Configure Kernel Features
         run: |
           cd "$GITHUB_WORKSPACE/ack-6.1/common"
+
+          # Kleaf fails the build unless gki_defconfig is in exact 'savedefconfig' form.
+          # We edit it with scripts/config, so turn that check off.
+          sed -i 's/check_defconfig//' build.config.gki* || true
+          grep -rl 'check_defconfig = "minimized"' BUILD.bazel ../build/kernel/kleaf 2>/dev/null \
+            | xargs -r sed -i 's/check_defconfig = "minimized"/check_defconfig = "disabled"/'
+          grep -n check_defconfig build.config.gki* BUILD.bazel || true
 
           # Enable KernelSU and SuSFS
           scripts/config --file arch/arm64/configs/gki_defconfig \
@@ -93,7 +112,6 @@ jobs:
             -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
             -d KSU_SUSFS_ENABLE_LOG \
             -e KPROBES \
-            -e HAVE_KPROBES \
             -e LRU_GEN \
             -e LRU_GEN_ENABLED \
             -e ZRAM_DEF_COMP_ZSTD \
@@ -109,8 +127,11 @@ jobs:
 
       - name: Build GKI Kernel
         run: |
+          (while true; do sleep 120; echo "--- disk ---"; df -h / "$GITHUB_WORKSPACE"; done) &
+          MON=$!
+          trap 'kill $MON 2>/dev/null || true' EXIT
           cd "$GITHUB_WORKSPACE/ack-6.1"
-          tools/bazel run --config=fast //common:kernel_aarch64_dist -- --destdir="$GITHUB_WORKSPACE/dist"
+          tools/bazel run --config=fast --verbose_failures //common:kernel_aarch64_dist -- --destdir="$GITHUB_WORKSPACE/dist"
           ls -lh "$GITHUB_WORKSPACE/dist"
           df -h / "$GITHUB_WORKSPACE"
 
