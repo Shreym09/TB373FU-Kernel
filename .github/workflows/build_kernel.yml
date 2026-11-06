@@ -7,15 +7,27 @@ jobs:
   build:
     name: Build Custom 6.1 GKI Kernel
     runs-on: ubuntu-22.04
+    timeout-minutes: 360
     steps:
       - name: Maximize Build Space
         uses: easimon/maximize-build-space@master
         with:
-          root-reserve-mb: 15360
-          swap-size-mb: 10240
+          root-reserve-mb: 8192
+          swap-size-mb: 8192
           remove-dotnet: 'true'
           remove-android: 'true'
           remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+
+      - name: Move caches onto the big volume
+        run: |
+          # Bazel and ccache write to ~/.cache, which lives on the small root disk.
+          # Point it at the workspace volume instead.
+          mkdir -p "$GITHUB_WORKSPACE/.cache"
+          rm -rf ~/.cache
+          ln -s "$GITHUB_WORKSPACE/.cache" ~/.cache
+          df -h / "$GITHUB_WORKSPACE"
 
       - name: Install Build Dependencies
         run: |
@@ -33,37 +45,38 @@ jobs:
 
       - name: Sync Android Common Kernel (ACK 6.1)
         run: |
-          mkdir -p ~/ack-6.1
-          cd ~/ack-6.1
+          mkdir -p "$GITHUB_WORKSPACE/ack-6.1"
+          cd "$GITHUB_WORKSPACE/ack-6.1"
           repo init -u https://android.googlesource.com/kernel/manifest -b common-android14-6.1 --depth=1
           repo sync -c -j$(nproc) --no-tags --no-clone-bundle
+          df -h / "$GITHUB_WORKSPACE"
 
       - name: Integrate KernelSU-Next & SuSFS
         run: |
-          cd ~/ack-6.1/common
-          
+          cd "$GITHUB_WORKSPACE/ack-6.1/common"
+
           # Setup KernelSU-Next
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next
-          
+
           # Setup SuSFS Patches for GKI 6.1
-          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android14-6.1 ~/susfs
-          cp ~/susfs/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch ./KernelSU-Next/
-          cp ~/susfs/kernel_patches/fs/* ./fs/
-          cp ~/susfs/kernel_patches/include/linux/* ./include/linux/
-          
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android14-6.1 "$GITHUB_WORKSPACE/susfs"
+          cp "$GITHUB_WORKSPACE/susfs/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" ./KernelSU-Next/
+          cp "$GITHUB_WORKSPACE"/susfs/kernel_patches/fs/* ./fs/
+          cp "$GITHUB_WORKSPACE"/susfs/kernel_patches/include/linux/* ./include/linux/
+
           # Apply SuSFS patch to KernelSU
           cd KernelSU-Next
           patch -p1 < 10_enable_susfs_for_ksu.patch || true
           cd ..
-          
+
           # Apply GKI SuSFS patch
-          cp ~/susfs/kernel_patches/50_add_susfs_in_gki-android14-6.1.patch ./
+          cp "$GITHUB_WORKSPACE/susfs/kernel_patches/50_add_susfs_in_gki-android14-6.1.patch" ./
           patch -p1 < 50_add_susfs_in_gki-android14-6.1.patch || true
 
       - name: Configure Kernel Features
         run: |
-          cd ~/ack-6.1/common
-          
+          cd "$GITHUB_WORKSPACE/ack-6.1/common"
+
           # Enable KernelSU and SuSFS
           scripts/config --file arch/arm64/configs/gki_defconfig \
             -e KSU \
@@ -96,23 +109,25 @@ jobs:
 
       - name: Build GKI Kernel
         run: |
-          cd ~/ack-6.1
-          LTO=thin tools/bazel run --config=fast //common:kernel_aarch64_dist
+          cd "$GITHUB_WORKSPACE/ack-6.1"
+          tools/bazel run --config=fast //common:kernel_aarch64_dist -- --destdir="$GITHUB_WORKSPACE/dist"
+          ls -lh "$GITHUB_WORKSPACE/dist"
+          df -h / "$GITHUB_WORKSPACE"
 
       - name: Package with AnyKernel3
         run: |
-          git clone https://github.com/osm0sis/AnyKernel3 ~/AnyKernel3
-          cd ~/AnyKernel3
+          git clone https://github.com/osm0sis/AnyKernel3 "$GITHUB_WORKSPACE/AnyKernel3"
+          cd "$GITHUB_WORKSPACE/AnyKernel3"
           sed -i 's/do.devicecheck=1/do.devicecheck=0/g' anykernel.sh
-          cp ~/ack-6.1/out/kernel_aarch64/dist/Image ./
-          gzip -n -k -f -9 Image > Image.gz
-          zip -r9 ~/Custom_Kernel_TB373FU_OneUI9.zip * -x .git README.md
+          cp "$GITHUB_WORKSPACE/dist/Image" ./
+          gzip -n -k -f -9 Image
+          zip -r9 "$GITHUB_WORKSPACE/Custom_Kernel_TB373FU_OneUI9.zip" * -x .git README.md
 
       - name: Upload Kernel Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: Custom-Kernel-TB373FU-OneUI9
           path: |
-            ~/ack-6.1/out/kernel_aarch64/dist/Image
-            ~/ack-6.1/out/kernel_aarch64/dist/Image.gz
-            ~/Custom_Kernel_TB373FU_OneUI9.zip
+            ${{ github.workspace }}/dist/Image
+            ${{ github.workspace }}/AnyKernel3/Image.gz
+            ${{ github.workspace }}/Custom_Kernel_TB373FU_OneUI9.zip
